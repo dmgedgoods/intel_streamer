@@ -2,28 +2,22 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"net/http"
-	"os"
 	"os/exec"
-	"os/signal"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/rivo/tview"
 )
 
-// Structure to parse story details
 type Story struct {
 	Title string `json:"title"`
 	URL   string `json:"url"`
 }
 
-// HighValueInsight represents high-value information as classified by Ollama
 type HighValueInsight struct {
 	Title    string
 	URL      string
@@ -32,9 +26,8 @@ type HighValueInsight struct {
 }
 
 const (
-	maxEntries      = 20              // Maximum number of entries to display
-	numStoriesFetch = 1               // Number of stories to fetch each time
-	defaultInterval = 5 * time.Second // Default interval for fetching stories
+	maxEntries      = 20 // Maximum number of entries to display
+	numStoriesFetch = 1  // Number of stories to fetch each time
 )
 
 // Fade levels with different color intensities
@@ -64,47 +57,30 @@ func main() {
 	var entries []string
 	seenStoryIDs := make(map[int]bool)
 
-	// Create a context to handle graceful shutdown
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	// Handle OS signals for graceful shutdown
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		<-sigChan
-		cancel()
-	}()
-
 	// Function to periodically fetch, analyze, and update the feed
 	go func() {
 		for {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-				stories, err := fetchTopStories(seenStoryIDs)
-				if err != nil {
-					entries = addEntry(entries, fmt.Sprintf("[red]Error: %v[-]", err))
-				} else {
-					for _, story := range stories {
-						// Use Ollama to determine if this story is high-value
-						insight, err := analyzeStory(story, "ollama")
-						if err != nil {
-							insight.Summary = "[red]Analysis not available[-]"
-						}
-						message := fmt.Sprintf("[yellow]Priority: %s[-]\n[green]%s[-]\n%s\n%s",
-							insight.Priority, insight.Title, insight.URL, insight.Summary)
-						entries = addEntry(entries, message)
+			stories, err := fetchTopStories(seenStoryIDs)
+			if err != nil {
+				entries = addEntry(entries, fmt.Sprintf("[red]Error: %v[-]", err))
+			} else {
+				for _, story := range stories {
+					// Use Ollama to determine if this story is high-value
+					insight, err := analyzeWithOllama(story)
+					if err != nil {
+						insight.Summary = "[red]Analysis not available[-]"
 					}
+					message := fmt.Sprintf("[yellow]Priority: %s[-]\n[green]%s[-]\n%s\n%s",
+						insight.Priority, insight.Title, insight.URL, insight.Summary)
+					entries = addEntry(entries, message)
 				}
-
-				// Update the TextView with the faded entries list
-				feedView.SetText(formatEntriesWithFade(entries))
-
-				// Wait before fetching again
-				time.Sleep(defaultInterval) // Adjust interval as needed
 			}
+
+			// Update the TextView with the faded entries list
+			feedView.SetText(formatEntriesWithFade(entries))
+
+			// Wait before fetching again
+			time.Sleep(5 * time.Second) // Adjust interval as needed
 		}
 	}()
 
@@ -145,18 +121,18 @@ func formatEntriesWithFade(entries []string) string {
 func fetchTopStories(seenStoryIDs map[int]bool) ([]Story, error) {
 	resp, err := http.Get("https://hacker-news.firebaseio.com/v0/topstories.json")
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch top stories: %w", err)
+		return nil, err
 	}
 	defer resp.Body.Close()
 
 	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read response body: %w", err)
+		return nil, err
 	}
 
 	var storyIDs []int
 	if err := json.Unmarshal(body, &storyIDs); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal story IDs: %w", err)
+		return nil, err
 	}
 
 	// Fetch details for the first numStoriesFetch unique stories that haven't been seen
@@ -182,57 +158,50 @@ func fetchStoryDetails(id int) (Story, error) {
 	url := fmt.Sprintf("https://hacker-news.firebaseio.com/v0/item/%d.json", id)
 	resp, err := http.Get(url)
 	if err != nil {
-		return Story{}, fmt.Errorf("failed to fetch story details: %w", err)
+		return Story{}, err
 	}
 	defer resp.Body.Close()
 
 	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
-		return Story{}, fmt.Errorf("failed to read response body: %w", err)
+		return Story{}, err
 	}
 
 	var story Story
 	if err := json.Unmarshal(body, &story); err != nil {
-		return Story{}, fmt.Errorf("failed to unmarshal story: %w", err)
+		return Story{}, err
 	}
 
 	return story, nil
 }
 
-// Analyzes a story using the specified service (either "ollama" or "openai")
-func analyzeStory(story Story, service string) (HighValueInsight, error) {
-	// Format the prompt for analysis
+// Uses Ollama to analyze and classify the importance of an article
+func analyzeWithOllama(story Story) (HighValueInsight, error) {
+	// Format the prompt for Ollama to analyze the story
 	prompt := fmt.Sprintf("You are an expert cybersecurity analyst. Analyze the following headline and URL to determine its relevance and priority in cybersecurity. Respond with a priority level (e.g., High, Medium, Low) and provide a summary if relevant. Keep everything very short.\n\nTitle: %s\nURL: %s", story.Title, story.URL)
 
-	var cmd *exec.Cmd
-	if service == "openai" {
-		// Run OpenAI command
-		cmd = exec.Command("openai", "api", "completions.create", "--model", "text-davinci-003", "--prompt", prompt)
-	} else {
-		// Run Ollama command
-		cmd = exec.Command("ollama", "run", "llama3.2", prompt)
-	}
-
+	// Run Ollama command with `ollama run`
+	cmd := exec.Command("ollama", "run", "llama3.2", prompt)
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	err := cmd.Run()
 	if err != nil {
-		return HighValueInsight{}, fmt.Errorf("failed to execute %s command: %w", service, err)
+		return HighValueInsight{}, fmt.Errorf("failed to execute Ollama command: %v", err)
 	}
 
-	// Parse the output from the analysis service
+	// Parse the output from Ollama
 	output := out.String()
 	lines := strings.Split(output, "\n")
 	if len(lines) < 2 {
 		return HighValueInsight{
 			Title:    story.Title,
 			URL:      story.URL,
-			Summary:  fmt.Sprintf("[red]Invalid response format from %s[-]", service),
+			Summary:  "[red]Invalid response format from Ollama[-]",
 			Priority: "Low",
 		}, nil
 	}
 
-	priority := lines[0] // Assuming the first line is the priority
+	priority := lines[0]
 	summary := strings.Join(lines[1:], " ")
 
 	return HighValueInsight{
